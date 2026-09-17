@@ -99,6 +99,8 @@ class RLlibSuntBus(MultiAgentEnv):
             uptime_normalized=uptime_normalized,
             real_routes=real_routes,
             route_metadata=route_metadata,
+            worker_index=env_config.get("worker_index", 0),
+            num_workers=env_config.get("num_workers", 1),
         )
 
         # Supersuit wrappers
@@ -215,6 +217,16 @@ class RLlibSuntBus(MultiAgentEnv):
     def close(self):
         self.env.close()
 
+    def _inner_parallel_env(self):
+        env = self.env
+        while hasattr(env, "env"):
+            env = env.env
+        return getattr(env, "unwrapped", env)
+
+    def set_regime(self, regime_id):
+        """Forward a driver-side regime pin through SuperSuit wrappers."""
+        self._inner_parallel_env().set_regime(regime_id)
+
     def get_env_info(self):
         return {
             "space_obs": self.observation_space,
@@ -305,8 +317,8 @@ def main():
     # Base run config
     run_config = {
         "local_mode": False,
-        "stop": {"timesteps_total": 400000},  # your requested 400k
-        "checkpoint_freq": 200,
+        "stop": {"timesteps_total": 40000},  # your requested 400k
+        "checkpoint_freq": 2000,
         "num_gpus": 0,         # adjust as needed
         "num_workers": 2,
         "share_policy": "individual",

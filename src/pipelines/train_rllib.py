@@ -64,6 +64,8 @@ def env_creator(config):
         uptime_normalized=uptime_normalized,
         real_routes=real_routes,
         route_metadata=route_metadata,
+        worker_index=config.get("worker_index", 0),
+        num_workers=config.get("num_workers", 1),
     )
 
     # === Wrappers ===

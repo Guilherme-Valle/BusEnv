@@ -54,6 +54,8 @@ class RLlibSuntBus(MultiAgentEnv):
             uptime_normalized=uptime_normalized,
             real_routes=real_routes,
             route_metadata=route_metadata,
+            worker_index=env_config.get("worker_index", 0),
+            num_workers=env_config.get("num_workers", 1),
         )
 
         # Wrappers of supersuit
@@ -100,6 +102,16 @@ class RLlibSuntBus(MultiAgentEnv):
 
     def close(self):
         self.env.close()
+
+    def _inner_parallel_env(self):
+        env = self.env
+        while hasattr(env, "env"):
+            env = env.env
+        return getattr(env, "unwrapped", env)
+
+    def set_regime(self, regime_id):
+        """Forward a driver-side regime pin through SuperSuit wrappers."""
+        self._inner_parallel_env().set_regime(regime_id)
 
     def get_env_info(self): # Returns env_info dict
         """Return environment information in a dictionary format."""
