@@ -26,7 +26,9 @@ class parallel_env(ParallelEnv):
                  stopClass=None, rewardClass=None, initial_nodes=None, target_nodes=None,
                  render_mode=None, avg_travel_time_AB=None, future_demand_at_B=None,
                  occupancy_rate=None, uptime_normalized=None,
-                 real_routes=None, route_metadata=None):  
+                 real_routes=None, route_metadata=None,
+                 worker_index=0, num_workers=1, regime_multipliers=None,
+                 regime_switch_every=50, context_window_size=10, use_context=True):
 
         # --- Basic configuration ---
         self.network = network
@@ -96,6 +98,7 @@ class parallel_env(ParallelEnv):
             "energy_efficiency": 1.0
         }
         self.occupancy_range = (0.6, 0.9)
+        self.use_context = bool(use_context)
 
         # --- Observation and action spaces ---
         self.observation_spaces = {
@@ -118,21 +121,196 @@ class parallel_env(ParallelEnv):
         self.route_metadata = route_metadata or {}
         self.agent_routes = {}
 
-        self.metrics_file = "env_metrics.csv" # To log metrics for analysis
+        # Per-second physical rates. Regime fuel/uptime knobs scale THESE, not
+        # travel_time, so a 2x Rain travel shock does not silently become a 4x
+        # fuel drain.
+        self._fuel_capacity = 100.0
+        self._base_fuel_per_sec = 1.0 / 300.0
+        self._base_uptime_per_sec = 1.0 / (12.0 * 3600.0)
+        self._wait_elapsed_sec = 60.0
+        self._service_path_factor = 0.3
 
-        if not os.path.exists(self.metrics_file): # Create the metrics file if it doesn't exist
+        # --- Controlled non-stationarity (multivariate regime switcher) ---
+        # 0 = Normal, 1 = Peak Hour, 2 = Rain
+        # Each axis is an independent physical knob:
+        #   travel     -> edge travel time only (_lookup_travel_time)
+        #   fuel       -> per-second fuel drain
+        #   uptime     -> per-second uptime decay
+        #   occupancy  -> EWMA occupancy *target*, then clipped to [0, 1]
+        self.current_regime = 0
+        self.episode_count = 0
+        self.regime_switch_every = int(regime_switch_every)
+        self.regime_multipliers = regime_multipliers or {
+            0: {"travel": 1.0, "fuel": 1.0, "uptime": 1.0, "occupancy": 1.0},
+            1: {"travel": 1.5, "fuel": 1.2, "uptime": 1.1, "occupancy": 1.3},
+            2: {"travel": 2.0, "fuel": 1.4, "uptime": 1.3, "occupancy": 1.1},
+        }
+        self.worker_index = int(worker_index)
+        self.num_workers = int(num_workers)
+        self.context_window_size = int(context_window_size)
+        self._context_windows = {}
+        self._context_ptrs = {}
+        self._context_counts = {}
+
+        # Per-worker file avoids two Ray actors appending to the same CSV.
+        self.metrics_file = f"env_metrics_w{self.worker_index}.csv"
+
+        if not os.path.exists(self.metrics_file):
             with open(self.metrics_file, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["episode", "env_steps", "mean_reward", "total_reward", "fairness"])
+                writer.writerow([
+                    "episode", "env_steps", "mean_reward", "total_reward",
+                    "fairness", "regime_id", "worker_index",
+                    "travel_mult", "fuel_mult", "uptime_mult", "occupancy_mult",
+                ])
 
 
     @property
     def num_agents(self):
         return self._num_agents
+
+    def _regime_params(self) -> dict:
+        """Return the four independent knobs for the active regime.
+
+        A legacy scalar multiplier is treated as travel-only so older configs
+        keep their previous behaviour.
+        """
+        raw = self.regime_multipliers.get(self.current_regime, {})
+        if isinstance(raw, dict):
+            return {
+                "travel": float(raw.get("travel", 1.0)),
+                "fuel": float(raw.get("fuel", 1.0)),
+                "uptime": float(raw.get("uptime", 1.0)),
+                "occupancy": float(raw.get("occupancy", 1.0)),
+            }
+        scale = float(raw) if raw != {} else 1.0
+        return {"travel": scale, "fuel": 1.0, "uptime": 1.0, "occupancy": 1.0}
+
+    def _regime_scale(self, key: str) -> float:
+        return self._regime_params()[key]
+
+    def _travel_time_multiplier(self) -> float:
+        """Return the travel-time scale factor for the active regime."""
+        return self._regime_scale("travel")
+
+    def _lookup_travel_time(self, start, target) -> float:
+        """Base edge travel time scaled by the travel knob only."""
+        base = self.avg_travel_time_AB.get((start, target), self.default_travel_time)
+        return base * self._travel_time_multiplier()
+
+    def _apply_fuel_drain(self, state, elapsed_sec: float) -> None:
+        drain = elapsed_sec * self._base_fuel_per_sec * self._regime_scale("fuel")
+        state["fuel"] = max(state["fuel"] - drain, 0.0)
+
+    def _apply_uptime_decay(self, state, elapsed_sec: float) -> None:
+        decay = elapsed_sec * self._base_uptime_per_sec * self._regime_scale("uptime")
+        state["uptime"] = max(state["uptime"] - decay, 0.0)
+
+    def _occupancy_target(self, raw_expected: float) -> float:
+        """Shift the occupancy EWMA target, then keep the state in [0, 1]."""
+        return float(np.clip(float(raw_expected) * self._regime_scale("occupancy"), 0.0, 1.0))
+
+    def _clip_reward(self, reward: float) -> float:
+        return float(np.clip(reward, -1.0, 1.0))
+
+    def _base_travel_time(self, start, target) -> float:
+        """Unscaled table travel time (the published timetable)."""
+        return float(self.avg_travel_time_AB.get((start, target), self.default_travel_time))
+
+    def _reset_context_windows(self, agents) -> None:
+        h = self.context_window_size
+        self._context_windows = {agent: np.zeros(h, dtype=np.float32) for agent in agents}
+        self._context_ptrs = {agent: 0 for agent in agents}
+        self._context_counts = {agent: 0 for agent in agents}
+
+    def _push_context_residual(self, agent, residual: float) -> None:
+        window = self._context_windows[agent]
+        ptr = self._context_ptrs[agent]
+        window[ptr] = float(residual)
+        self._context_ptrs[agent] = (ptr + 1) % self.context_window_size
+        self._context_counts[agent] = min(self.context_window_size, self._context_counts[agent] + 1)
+
+    def _context_feature(self, agent) -> float:
+        """Regime identity: mean |residual| over the last H steps (stays high all regime)."""
+        n = self._context_counts.get(agent, 0)
+        if n <= 0:
+            return 0.0
+        window = self._context_windows[agent]
+        filled = window[:n] if n < self.context_window_size else window
+        return float(np.clip(np.mean(np.abs(filled)), 0.0, 10.0))
+
+    def _record_physical_surprise(
+            self, agent, elapsed_sec, travel_realized=None, travel_base=None,
+            occ_prev=None, occ_now=None) -> float:
+        """ESCP-style surprise. Travel term is (realized/base - 1) so Peak≈0.5, Rain≈1.0."""
+        travel_resid = 0.0
+        if travel_realized is not None and travel_base is not None:
+            base = float(travel_base)
+            travel_resid = (float(travel_realized) - base) / (base + 1e-8)
+
+        occ_resid = 0.0
+        if occ_prev is not None and occ_now is not None:
+            occ_resid = float(occ_now) - float(occ_prev)
+
+        fuel_extra = float(elapsed_sec) * self._base_fuel_per_sec * (self._regime_scale("fuel") - 1.0)
+        fuel_resid = fuel_extra / self._fuel_capacity
+
+        surprise = abs(travel_resid) + abs(occ_resid) + abs(fuel_resid)
+        self._push_context_residual(agent, surprise)
+        return self._context_feature(agent)
+
+    def _make_obs(self, agent, curr_node, next_node, occupancy, uptime, maintenance_ok):
+        travel_time = self._lookup_travel_time(curr_node, next_node)
+        normalized_travel_time = min(travel_time / self.max_travel_time, 1.0)
+        channels = [
+            self.agent_times[agent] / (24 * 60 * 60),
+            occupancy,
+            normalized_travel_time,
+            self.future_demand_at_B.get(next_node, 0.0),
+            uptime,
+            1.0 if maintenance_ok else 0.0,
+            self.node_to_idx[str(curr_node)],
+            self.node_to_idx[str(next_node)],
+        ]
+        if self.use_context:
+            channels.append(self._context_feature(agent))
+        obs_array = np.array(channels, dtype=np.float32)
+        return np.clip(
+            obs_array,
+            self.observation_space(agent).low,
+            self.observation_space(agent).high,
+        )
+
+    def set_regime(self, regime_id: int) -> None:
+        """Pin the active regime (driver callbacks can keep Ray workers aligned)."""
+        regime_id = int(regime_id)
+        if regime_id not in self.regime_multipliers:
+            raise ValueError(
+                f"Unknown regime_id={regime_id}. "
+                f"Known regimes: {list(self.regime_multipliers)}"
+            )
+        self.current_regime = regime_id
+
+    def _update_regime_on_episode_start(self, options=None):
+        """Advance the episode counter and rotate, unless a regime is pinned.
+
+        `expected_times` stay on the unscaled timetable on purpose: the
+        published schedule does not know about Peak/Rain, so efficiency
+        degradation is part of the distribution shift.
+        """
+        self.episode_count += 1
+        options = options or {}
+        if "regime_id" in options:
+            self.set_regime(options["regime_id"])
+            return
+        num_regimes = len(self.regime_multipliers)
+        self.current_regime = ((self.episode_count - 1) // self.regime_switch_every) % num_regimes
     
     def reset(self, seed=None, options=None):
         if seed is not None:
             self.np_random, _ = gym.utils.seeding.np_random(seed)
+
+        self._update_regime_on_episode_start(options)
 
         self.agents = self.possible_agents[:]  
         self.states = {}
@@ -148,6 +326,7 @@ class parallel_env(ParallelEnv):
 
         observations = {}
         self.infos = {}
+        self._reset_context_windows(self.agents)
 
         for agent in self.agents:
             if agent not in self.agent_routes:  
@@ -164,9 +343,11 @@ class parallel_env(ParallelEnv):
 
             self.agent_states[agent] = {
                 "location": initial,
-                "occupancy": int(self.occupancy_rate.get(int(initial), 0.0)),
+                "occupancy": self._occupancy_target(
+                    float(self.occupancy_rate.get(int(initial), 0.0))
+                ),
                 "uptime": float(self.uptime_normalized.get(initial, 1.0)),
-                "fuel": 100.0,
+                "fuel": self._fuel_capacity,
                 "maintenance_status": "ok",
                 "schedule": [],
                 "route": path,
@@ -179,35 +360,22 @@ class parallel_env(ParallelEnv):
             self.estimated_times[agent] = 0
             self.delays[agent] = {}
 
+            # Unscaled timetable on purpose: Peak/Rain are shocks relative to
+            # the published schedule, so energy_efficiency degrades under load.
             self.expected_times[agent] = sum(
                 self.avg_travel_time_AB.get((path[i], path[i + 1]), self.default_travel_time)
                 for i in range(len(path) - 1)
             )
 
             next_node = path[1]
-            travel_time = self.avg_travel_time_AB.get((initial, next_node), self.default_travel_time)
-            normalized_travel_time = min(travel_time / self.max_travel_time, 1.0)
-
-            obs_array = np.array([
-                self.agent_times[agent] / (24 * 60 * 60),
+            observations[agent] = self._make_obs(
+                agent,
+                initial,
+                next_node,
                 self.agent_states[agent]["occupancy"],
-                normalized_travel_time,
-                self.future_demand_at_B.get(next_node, 0.0),
-                self.uptime_normalized.get(agent, 1.0),
-                1.0 if self.agent_states[agent]["maintenance_status"] == "ok" else 0.0,
-                self.node_to_idx[str(initial)],
-                self.node_to_idx[str(next_node)],
-            ], dtype=np.float32)
-
-            # APPLY CLIPPING HERE!
-            #    Use the limits (low/high) that you defined in your observation_space
-            clipped_obs = np.clip(
-                obs_array,
-                self.observation_space(agent).low,  # Accessing the limits of the Box space
-                self.observation_space(agent).high, # Accessing the limits of the Box space
+                self.agent_states[agent]["uptime"],
+                self.agent_states[agent]["maintenance_status"] == "ok",
             )
-
-            observations[agent] = clipped_obs
 
 
             self.infos[agent] = {
@@ -248,7 +416,7 @@ class parallel_env(ParallelEnv):
                 #print(f"[ERROR] Agent {agent} exceeded the route. IDX={idx}, LEN={len(route)}")
                 terminations[agent] = True
                 truncations[agent] = False
-                rewards[agent] = -1.0
+                rewards[agent] = self._clip_reward(-1.0)
                 continue
 
             curr_node = route[idx]  # Current node of the agent
@@ -256,14 +424,18 @@ class parallel_env(ParallelEnv):
 
             action = actions[agent]  # Action chosen by the agent
             #print(f"[DEBUG] action: {action} for agent: {agent}")
+            elapsed_sec = 0.0
+            travel_realized = None
+            travel_base = None
+            occ_before = float(state.get("occupancy", 0.0))
 
             # ================= WAIT =================
             if action == 0:  
-                reward = -0.1  # Penalty for waiting
-                elapsed = 60.0  # Assume 1 minute of waiting
-                self.agent_times[agent] += elapsed # Update agent's internal clock
-                state["uptime"] = max(state["uptime"] - elapsed / (12 * 3600), 0.0)
-                state["fuel"] = max(state["fuel"] - elapsed / 300.0, 0.0)
+                reward = self._clip_reward(-0.1)
+                elapsed_sec = self._wait_elapsed_sec
+                self.agent_times[agent] += elapsed_sec
+                self._apply_uptime_decay(state, elapsed_sec)
+                self._apply_fuel_drain(state, elapsed_sec)
                 terminated = self.agent_times[agent] >= 24 * 3600
                 truncated = False
 
@@ -294,25 +466,27 @@ class parallel_env(ParallelEnv):
                 #      f"(t={self.current_time/3600:.2f}h, occ={state.get('occupancy',0):.1f}, "
                 #      f"fuel={state.get('fuel',0):.1f}, uptime={state.get('uptime',0):.2f})")
 
-                travel_time = self.avg_travel_time_AB.get((curr_node, next_node), self.default_travel_time)
+                # Travel knob only; fuel/uptime use independent per-second rates.
+                travel_time = self._lookup_travel_time(curr_node, next_node)
 
                 prev_occ = state.get("occupancy", 0.0)
                 if int(curr_node) in self.occupancy_rate:
-                    expected_occ = self.occupancy_rate[int(curr_node)]
+                    expected_occ = self._occupancy_target(self.occupancy_rate[int(curr_node)])
                     alpha = 0.5
                     new_occ = (1 - alpha) * prev_occ + alpha * expected_occ
                     occupancy = max(0.0, min(new_occ, 1.0))
-                    #print(f"[DEBUG] Expected Occupancy: {expected_occ:.2f}, Previous Occupancy: {prev_occ:.2f}, New Occupancy: {occupancy:.2f}")
                 else:
-                    #print(f"[DEBUG] No Expected Occupancy for Node {curr_node}. Using Previous Occupancy: {prev_occ:.2f}")
                     occupancy = prev_occ
 
                 state["occupancy"] = occupancy
                 self.agent_times[agent] += travel_time
                 self.estimated_times[agent] += travel_time
-                state["uptime"] = max(state["uptime"] - travel_time / (12 * 3600), 0.0)
-                state["fuel"] = max(state["fuel"] - travel_time / 300.0, 0.0)
+                self._apply_uptime_decay(state, travel_time)
+                self._apply_fuel_drain(state, travel_time)
                 self.states[agent] = next_node
+                elapsed_sec = travel_time
+                travel_realized = travel_time
+                travel_base = self._base_travel_time(curr_node, next_node)
 
                 if next_node not in self.headways:
                     self.headways[next_node] = []
@@ -341,107 +515,99 @@ class parallel_env(ParallelEnv):
                 try:
                     path = nx.shortest_path(
                         self.network, source=curr_node, target=sc_node,
-                        weight=lambda u, v, d: self.avg_travel_time_AB.get((u, v), self.default_travel_time)
+                        weight=lambda u, v, d: self._lookup_travel_time(u, v)
                     )
 
                     total_travel_time = 0.0
                     total_fuel_cost = 0.0
+                    total_base_travel = 0.0
+                    fuel_rate = self._base_fuel_per_sec * self._regime_scale("fuel")
 
                     for u, v in zip(path[:-1], path[1:]):
-                        edge_time = self.avg_travel_time_AB.get((u, v), self.default_travel_time)
-                        edge_time *= 0.3
+                        edge_time = self._lookup_travel_time(u, v) * self._service_path_factor
                         total_travel_time += edge_time
-                        total_fuel_cost += edge_time / 300.0
-
-                    #print(f"[SERVICE_CENTER] Agent {agent} traveling path {path} "
-                    #      f"with total travel time={total_travel_time:.2f}, fuel cost={total_fuel_cost:.2f}")
+                        total_base_travel += self._base_travel_time(u, v) * self._service_path_factor
+                        total_fuel_cost += edge_time * fuel_rate
                 except nx.NetworkXNoPath:
-                    #print(f"[SERVICE_CENTER][ERROR] No path from {curr_node} to {sc_node}")
-                    reward = -10.0
+                    reward = self._clip_reward(-1.0)
                     terminated = False
                     truncated = False
                 else:
-                    reward = 0.0
-                    if state["fuel"] > 0.8 and state["uptime"] > 0.8:
-                        reward -= 0.5 * total_travel_time  
+                    travel_norm = min(total_travel_time / self.max_travel_time, 1.0)
+                    unnecessary = (
+                        state["fuel"] > 0.8 * self._fuel_capacity
+                        and state["uptime"] > 0.8
+                    )
 
                     if state["fuel"] < total_fuel_cost:
-                        #print(f"[SERVICE_CENTER][FAIL] Agent {agent} insufficient fuel "
-                        #      f"({state['fuel']:.2f}) needs {total_fuel_cost:.2f}")
-                        reward = -20.0
+                        reward = self._clip_reward(-1.0)
                     else:
                         self.agent_times[agent] += total_travel_time
                         self.estimated_times[agent] += total_travel_time
                         state["fuel"] = max(state["fuel"] - total_fuel_cost, 0.0)
-                        state["uptime"] = max(state["uptime"] - total_travel_time / (12 * 3600), 0.0)
+                        self._apply_uptime_decay(state, total_travel_time)
 
-                        state["fuel"] = 100.0
+                        state["fuel"] = self._fuel_capacity
                         state["uptime"] = 1.0
                         state["maintenance_status"] = "ok"
                         self.states[agent] = sc_node
-                        reward = -1.0 * (1 + total_travel_time / 600.0)
+                        # Detour cost in [-1, 0]; extra hit if the bus did not need service.
+                        reward = -travel_norm
+                        if unnecessary:
+                            reward -= 0.25
+                        reward = self._clip_reward(reward)
+                        elapsed_sec = total_travel_time
+                        travel_realized = total_travel_time
+                        travel_base = total_base_travel
 
                 terminated = self.agent_times[agent] >= 24 * 3600
                 truncated = self.steps[agent] >= self.max_steps
 
             else:
-                reward = -10.0
+                reward = self._clip_reward(-1.0)
                 terminated = False
                 truncated = True
 
             # ================= OBSERVATION UPDATE =================
+            if self.use_context:
+                self._record_physical_surprise(
+                    agent,
+                    elapsed_sec=elapsed_sec,
+                    travel_realized=travel_realized,
+                    travel_base=travel_base,
+                    occ_prev=occ_before,
+                    occ_now=float(state.get("occupancy", occ_before)),
+                )
             route_idx = self.agent_states[agent]["route_idx"]
             curr_node = self.states[agent]
             next_node = route[route_idx + 1] if route_idx + 1 < len(route) else curr_node
-
-            travel_time = self.avg_travel_time_AB.get((curr_node, next_node), self.default_travel_time)
-            normalized_travel_time = min(travel_time / self.max_travel_time, 1.0)
-            
-            #print(f"[STEP] agent: {agent}")
-            #print(f"[STEP] self.future_demand_at_B.get(next_node, 0.0): {self.future_demand_at_B.get(next_node, 0.0)}")
-            #print(f"[STEP]  self.agent_times[agent] : {self.agent_times[agent]}") 
-            #print(f"[STEP]  self.agent_times[agent] / (24 * 60 * 60): {self.agent_times[agent] / (24 * 60 * 60)}")
-            #print(f"[STEP]  normalized_travel_time: {normalized_travel_time}")
-            #print(f"[STEP]  self.occupancy_rate.get(curr_node, 0.0): {self.occupancy_rate.get(int(curr_node), 0.0)}")
-            #print(f"[STEP]  state['occupancy']: {state['occupancy']}")
-            #print(f"[STEP]  state['uptime']: {state['uptime']}")
-            #print(f"[STEP]  state['fuel']: {state['fuel']}")
-            #print(f"[STEP]  curr_node: {curr_node}")
-            #print(f"[STEP]  next_node: {next_node}")
-            #print(f"[STEP]  travel_time: {travel_time}")
-            #print(f"[STEP]  self.node_to_idx[str(curr_node)]: {self.node_to_idx[str(curr_node)]}")
-            #print(f"[STEP]  self.node_to_idx[str(next_node)]: {self.node_to_idx[str(next_node)]}")
-
-            # 1. Crie o array de observação como antes
-            obs_array = np.array([
-                self.agent_times[agent] / (24 * 60 * 60),
+            observations[agent] = self._make_obs(
+                agent,
+                curr_node,
+                next_node,
                 state["occupancy"],
-                normalized_travel_time,
-                self.future_demand_at_B.get(next_node, 0.0),
                 state["uptime"],
-                1.0 if state["maintenance_status"] == "ok" else 0.0,
-                self.node_to_idx[str(curr_node)],
-                self.node_to_idx[str(next_node)],
-            ], dtype=np.float32)
-
-            # APPLY CLIPPING HERE!
-            clipped_obs = np.clip(
-                obs_array,
-                self.observation_space(agent).low,
-                self.observation_space(agent).high
+                state["maintenance_status"] == "ok",
             )
 
-            observations[agent] = clipped_obs
-
-            rewards[agent] = reward
+            rewards[agent] = self._clip_reward(reward)
             terminations[agent] = terminated
             truncations[agent] = truncated
+            regime = self._regime_params()
             infos[agent] = {
                 "count": self.steps[agent],
                 "occupancy": state["occupancy"],
                 "location": curr_node,
                 "next_stop": next_node,
                 "headways": self.headways.get(curr_node, []),
+                "regime_id": self.current_regime,
+                "episode_count": self.episode_count,
+                "worker_index": self.worker_index,
+                "regime_travel": regime["travel"],
+                "regime_fuel": regime["fuel"],
+                "regime_uptime": regime["uptime"],
+                "regime_occupancy": regime["occupancy"],
+                "context_var": self._context_feature(agent),
             }
             
             if self.agent_times[agent] >= 24 * 3600:
@@ -482,6 +648,7 @@ class parallel_env(ParallelEnv):
         self.episode_counter += 1
 
         env_steps = sum(self.steps.values())
+        regime = self._regime_params()
         with open(self.metrics_file, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -489,7 +656,13 @@ class parallel_env(ParallelEnv):
                 env_steps,
                 mean_reward,
                 total_reward,
-                fairness
+                fairness,
+                self.current_regime,
+                self.worker_index,
+                regime["travel"],
+                regime["fuel"],
+                regime["uptime"],
+                regime["occupancy"],
             ])
 
 
@@ -511,27 +684,32 @@ class parallel_env(ParallelEnv):
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
+        low = [
+            0.0,    # time_of_day_norm
+            0.0,    # occupancy_rate
+            0.0,    # avg_travel_time_AB (normalizado)
+            0.0,    # future_demand_at_B
+            0.0,    # uptime
+            0.0,    # maintenance_status
+            0.0,    # curr_node_id
+            0.0,    # next_node_id
+        ]
+        high = [
+            1.0,    # time_of_day_norm
+            1.0,    # occupancy_rate
+            1.0,    # avg_travel_time_AB (normalizado!)
+            1e6,    # future_demand_at_B (mantém valor realista)
+            1.0,    # uptime
+            1.0,    # manutenção ok
+            2e9,    # curr_node_id
+            2e9,    # next_node_id
+        ]
+        if self.use_context:
+            low.append(0.0)    # context_var
+            high.append(10.0)
         return spaces.Box(
-            low=np.array([
-                0.0,    # time_of_day_norm
-                0.0,    # occupancy_rate
-                0.0,    # avg_travel_time_AB (normalizado)
-                0.0,    # future_demand_at_B
-                0.0,    # uptime
-                0.0,    # maintenance_status
-                0.0,    # curr_node_id
-                0.0     # next_node_id
-            ], dtype=np.float32),
-            high=np.array([
-                1.0,    # time_of_day_norm
-                1.0,    # occupancy_rate
-                1.0,    # avg_travel_time_AB (normalizado!)
-                1e6,    # future_demand_at_B (mantém valor realista)
-                1.0,    # uptime
-                1.0,    # manutenção ok
-                2e9,    # curr_node_id
-                2e9     # next_node_id
-            ], dtype=np.float32)
+            low=np.array(low, dtype=np.float32),
+            high=np.array(high, dtype=np.float32),
         )
 
     @functools.lru_cache(maxsize=None)

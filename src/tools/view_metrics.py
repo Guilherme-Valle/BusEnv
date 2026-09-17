@@ -1,8 +1,10 @@
+import glob
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Load metrics file
-df = pd.read_csv("env_metrics.csv")
+# Per-worker files from the multivariate regime switcher; fall back to the legacy name.
+metric_files = sorted(glob.glob("env_metrics_w*.csv")) or ["env_metrics.csv"]
+df = pd.concat([pd.read_csv(path) for path in metric_files], ignore_index=True)
 
 # Group by episode to avoid multiple entries per episode
 df_grouped = df.groupby("episode").mean().reset_index()
