@@ -8,14 +8,9 @@ from gym.spaces import Dict as GymDict
 
 from marllib import marl
 from marllib.envs.base_env import ENV_REGISTRY
-from marllib.marl.algos.core.IL import a2c as marl_a2c_core
-
-try:
-    from marllib.marl.algos.scripts import ia2c as marl_a2c_script
-    _ALGO_ATTR = "ia2c"
-except ImportError:
-    from marllib.marl.algos.scripts import a2c as marl_a2c_script
-    _ALGO_ATTR = "a2c"
+from marllib.marl.algos.core.IL import ppo as marl_ppo_core
+from marllib.marl.algos.scripts import ppo as marl_ppo_script
+_ALGO_ATTR = "ppo"
 
 from ray.rllib.models import ModelCatalog
 from envs.sunt_env import parallel_env
@@ -24,7 +19,7 @@ from supersuit import pad_observations_v0, pad_action_space_v0
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 
 from models.base_mlp import BaseMLPCustom
-from models.custom_a3c_torch_policy import CustomA3CTorchPolicy, CustomIA2CTrainer
+from models.custom_ppo_torch_policy import CustomPPOTorchPolicy, CustomIPPOTrainer
 
 # Absolute src/ root via the imported package (stable under Ray Tune CWD changes)
 _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(sunt_env_module.__file__)))
@@ -164,7 +159,7 @@ class RLlibSuntBus(MultiAgentEnv):
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Custom IA2C with ESCP context + Fast TRAC")
+        description="Custom IPPO with ESCP context + Fast TRAC")
     parser.add_argument("--stop-timesteps", type=int, default=1_000_000)
     parser.add_argument("--stop-iters", type=int, default=None,
                         help="Optional cap on training iterations (useful for smoke tests)")
@@ -211,20 +206,30 @@ if _args.ablation_baseline:
 _use_context = not _args.no_context
 _ensure_marllib_env_yaml()
 
-# MARLlib A2C/IA2C hardcodes stock A3CTorchPolicy; swap in the TRAC loss.
-if hasattr(marl_a2c_script, "IA2CTrainer"):
-    marl_a2c_script.IA2CTrainer = CustomIA2CTrainer
-if hasattr(marl_a2c_core, "IA2CTrainer"):
-    marl_a2c_core.IA2CTrainer = CustomIA2CTrainer
-if hasattr(marl_a2c_core, "IA2CTorchPolicy"):
-    marl_a2c_core.IA2CTorchPolicy = CustomA3CTorchPolicy
+# MARLlib IPPO hardcodes stock PPOTorchPolicy; swap in the TRAC loss.
+if hasattr(marl_ppo_script, "PPOTrainer"):
+    marl_ppo_script.PPOTrainer = CustomIPPOTrainer
+if hasattr(marl_ppo_core, "PPOTrainer"):
+    marl_ppo_core.PPOTrainer = CustomIPPOTrainer
+if hasattr(marl_ppo_core, "PPOTorchPolicy"):
+    marl_ppo_core.PPOTorchPolicy = CustomPPOTorchPolicy
 
-# Fix MARLlib completely ignoring the local_dir we pass in the config
-_orig_tune_run_a2c = marl_a2c_script.tune.run
-def _patched_tune_run_a2c(*args, **kwargs):
+# Fix MARLlib PPO hardcoding sgd_minibatch_size > episode_limit which breaks Ray
+_orig_tune_run = marl_ppo_script.tune.run
+def _patched_tune_run(*args, **kwargs):
+    config = kwargs.get("config")
+    if config:
+        # Override the weird MARLlib logic that scales sgd_minibatch_size 
+        # beyond episode_limit (which is 1M for BusEnv).
+        config["sgd_minibatch_size"] = 256
+        config["train_batch_size"] = _args.fixed_batch_timesteps
+        config["model"]["max_seq_len"] = 1000  # Avoid OOM in models if ever used
+    
+    # MARLlib forcibly ignores the user's local_dir. We restore it here.
     kwargs["local_dir"] = local_dir_path
-    return _orig_tune_run_a2c(*args, **kwargs)
-marl_a2c_script.tune.run = _patched_tune_run_a2c
+    
+    return _orig_tune_run(*args, **kwargs)
+marl_ppo_script.tune.run = _patched_tune_run
 
 # run_il always registers Base_RNN as "Base_Model". Keep our MLP instead.
 _orig_register = ModelCatalog.register_custom_model
@@ -286,20 +291,24 @@ run_config = {
 }
 
 custom_config = {
-    "lr": 0.0003,
+    "lr": 0.0003,  # Diminuído um pouco para não explodir
     "batch_episode": 20,
     "gamma": 0.99,
-    "vf_loss_coeff": 1.0,
-    "entropy_coeff": 0.01,
-    "entropy_coeff_schedule": [[0, 0.01], [1000000, 0.0001]],
+    "vf_loss_coeff": 0.5,  # Reduzido pela metade para priorizar política
+    "entropy_coeff": 0.05, # Aumentado 5x no começo para forçar exploração do mapa
+    "entropy_coeff_schedule": [[0, 0.05], [800000, 0.001], [1000000, 0.0001]], # Cai suave
     "use_gae": True,
-    "lambda": 1.0,
+    "lambda": 0.95, # Mais viés, menos variância no GAE
+    "clip_param": 0.4, # PPO menos restritivo com a política
+    "vf_clip_param": 50.0,
+    "sgd_minibatch_size": 128, # Menor minibatch para atualizações mais frequentes
+    "num_sgd_iter": 10,
     "use_context": _use_context,
     "trac_lambda_min": 0.0,
-    "trac_lambda_max": 0.0 if _args.no_trac else 8.0,
-    "trac_lambda_k": 4.0,
-    "trac_anchor_every": 200,
-    "trac_refresh_alert_max": 0.2,
+    "trac_lambda_max": 0.0 if _args.no_trac else 0.5,  # TRAC levíssimo no PPO
+    "trac_lambda_k": 2.0, # Curva mais suave
+    "trac_anchor_every": 100,
+    "trac_refresh_alert_max": 0.15,
     "trac_context_weight": 1.0,
 }
 
@@ -310,7 +319,7 @@ if _args.stop_iters is not None:
     stop_conditions["training_iteration"] = _args.stop_iters
 
 print(
-    "[train_custom_a2c] "
+    "[train_custom_ppo] "
     f"regimes=ON context={'ON' if _use_context else 'OFF'} "
     f"trac={'OFF' if _args.no_trac else 'ON'} | "
     f"stop={stop_conditions} workers={_args.num_workers} "

@@ -6,7 +6,7 @@ env_args:
   obs_dir: "training_observation"
   actions_amount: 3
   max_steps: 1000000
-  num_agents: 5
+  num_buses: 5
   regime_switch_every: 50
   use_context: true
   avg_travel_time_AB_file: "avg_travel_time_AB.pkl"
